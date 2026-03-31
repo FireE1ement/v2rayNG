@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.v2ray.ang.AppConfig
@@ -18,12 +19,16 @@ import com.v2ray.ang.service.V2RayProxyOnlyService
 import com.v2ray.ang.service.V2RayVpnService
 import com.v2ray.ang.util.MessageUtil
 import com.v2ray.ang.util.Utils
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import libv2ray.CoreCallbackHandler
 import libv2ray.CoreController
 import java.lang.ref.SoftReference
+import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 object V2RayServiceManager {
 
@@ -36,6 +41,17 @@ object V2RayServiceManager {
             field = value
             V2RayNativeManager.initCoreEnv(value?.get()?.getService())
         }
+
+    // === НОВЫЕ ПОЛЯ ДЛЯ АВТОПЕРЕКЛЮЧЕНИЯ ===
+    private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var serverTestingJob: Job? = null
+    private var isSwitchingServer = AtomicBoolean(false)
+    private val serverLatencyCache = ConcurrentHashMap<String, Long>()
+    private var lastSwitchedTime: Long = 0
+    private const val MIN_SWITCH_INTERVAL_MS = 10000L // Минимум 10 сек между переключениями
+    private const val SERVER_TEST_TIMEOUT_MS = 8000
+    private const val MAX_PARALLEL_TESTS = 5
+    // === КОНЕЦ НОВЫХ ПОЛЕЙ ===
 
     /**
      * Starts the V2Ray service from a toggle action.
@@ -59,8 +75,22 @@ object V2RayServiceManager {
     fun startVService(context: Context, guid: String? = null) {
         Log.i(AppConfig.TAG, "StartCore-Manager: startVService from ${context::class.java.simpleName}")
 
-        if (guid != null) {
-            MmkvManager.setSelectServer(guid)
+        // === НОВАЯ ЛОГИКА: Автовыбор лучшего сервера при старте ===
+        val finalGuid = if (guid == null && SettingsManager.isAutoSelectBestServer()) {
+            Log.i(AppConfig.TAG, "StartCore-Manager: Auto-selecting best server")
+            runBlocking(Dispatchers.IO) {
+                selectBestServer()?.also { bestGuid ->
+                    Log.i(AppConfig.TAG, "StartCore-Manager: Selected best server: $bestGuid")
+                    MmkvManager.setSelectServer(bestGuid)
+                }
+            }
+        } else {
+            guid
+        }
+        // === КОНЕЦ НОВОЙ ЛОГИКИ ===
+
+        if (finalGuid != null) {
+            MmkvManager.setSelectServer(finalGuid)
         }
 
         startContextService(context)
@@ -71,7 +101,6 @@ object V2RayServiceManager {
      * @param context The context from which the service is stopped.
      */
     fun stopVService(context: Context) {
-        //context.toast(R.string.toast_services_stop)
         MessageUtil.sendMsg2Service(context, AppConfig.MSG_STATE_STOP, "")
     }
 
@@ -87,11 +116,216 @@ object V2RayServiceManager {
      */
     fun getRunningServerName() = currentConfig?.remarks.orEmpty()
 
+    // === НОВЫЕ МЕТОДЫ ДЛЯ АВТОПЕРЕКЛЮЧЕНИЯ ===
+
     /**
-     * Starts the context service for V2Ray.
-     * Chooses between VPN service or Proxy-only service based on user settings.
-     * @param context The context from which the service is started.
+     * Запрашивает переключение на лучший сервер (вызывается из V2RayVpnService при сбое)
      */
+    fun requestServerSwitch() {
+        if (isSwitchingServer.get()) {
+            Log.w(AppConfig.TAG, "StartCore-Manager: Server switch already in progress")
+            return
+        }
+
+        // Проверяем интервал между переключениями
+        val timeSinceLastSwitch = SystemClock.elapsedRealtime() - lastSwitchedTime
+        if (timeSinceLastSwitch < MIN_SWITCH_INTERVAL_MS) {
+            Log.w(AppConfig.TAG, "StartCore-Manager: Switch too frequent, delaying")
+            managerScope.launch {
+                delay(MIN_SWITCH_INTERVAL_MS - timeSinceLastSwitch)
+                performServerSwitch()
+            }
+            return
+        }
+
+        managerScope.launch {
+            performServerSwitch()
+        }
+    }
+
+    /**
+     * Выполняет переключение на лучший доступный сервер
+     */
+    private suspend fun performServerSwitch() {
+        if (!isSwitchingServer.compareAndSet(false, true)) return
+
+        try {
+            Log.i(AppConfig.TAG, "StartCore-Manager: Performing server switch")
+            
+            val currentGuid = MmkvManager.getSelectServer()
+            val bestServer = selectBestServer(excludeGuid = currentGuid)
+            
+            if (bestServer == null) {
+                Log.e(AppConfig.TAG, "StartCore-Manager: No alternative server available")
+                // Перезапускаем текущий как последняя попытка
+                restartCurrentServer()
+                return
+            }
+
+            Log.i(AppConfig.TAG, "StartCore-Manager: Switching to server: $bestServer")
+            
+            // Отправляем команду на переключение в V2RayVpnService
+            val service = getService() ?: return
+            val intent = Intent(service, V2RayVpnService::class.java)
+            intent.action = "SWITCH_SERVER"
+            intent.putExtra("server_guid", bestServer)
+            
+            ContextCompat.startForegroundService(service, intent)
+            
+            lastSwitchedTime = SystemClock.elapsedRealtime()
+            
+            // Уведомляем UI о переключении
+            MessageUtil.sendMsg2UI(service, AppConfig.MSG_STATE_SERVER_SWITCHED, bestServer)
+            
+        } catch (e: Exception) {
+            Log.e(AppConfig.TAG, "StartCore-Manager: Server switch failed", e)
+        } finally {
+            isSwitchingServer.set(false)
+        }
+    }
+
+    /**
+     * Перезапускает текущий сервер (последняя попытка восстановления)
+     */
+    private suspend fun restartCurrentServer() {
+        Log.i(AppConfig.TAG, "StartCore-Manager: Restarting current server")
+        val service = getService() ?: return
+        
+        withContext(Dispatchers.Main) {
+            stopCoreLoop()
+            delay(2000)
+            startContextService(service)
+        }
+    }
+
+    /**
+     * Выбирает лучший сервер по задержке (параллельное тестирование)
+     * @param excludeGuid GUID сервера для исключения (текущий нерабочий)
+     * @return GUID лучшего сервера или null
+     */
+    suspend fun selectBestServer(excludeGuid: String? = null): String? = withContext(Dispatchers.IO) {
+        val allServers = MmkvManager.decodeServerList()
+            .mapNotNull { MmkvManager.decodeServerConfig(it) }
+            .filter { it.guid != excludeGuid }
+            .filter { it.configType != EConfigType.POLICYGROUP } // Пропускаем группы
+            .filter { isValidServer(it) }
+
+        if (allServers.isEmpty()) {
+            Log.w(AppConfig.TAG, "StartCore-Manager: No servers available for testing")
+            return@withContext null
+        }
+
+        Log.i(AppConfig.TAG, "StartCore-Manager: Testing ${allServers.size} servers")
+
+        // Используем семафор для ограничения параллельных тестов
+        val semaphore = kotlinx.coroutines.sync.Semaphore(MAX_PARALLEL_TESTS)
+        val results = ConcurrentHashMap<String, Long>()
+
+        val testJobs = allServers.map { server ->
+            async {
+                semaphore.withPermit {
+                    val latency = testServerLatency(server)
+                    if (latency >= 0) {
+                        results[server.guid] = latency
+                        Log.d(AppConfig.TAG, "StartCore-Manager: Server ${server.remarks} latency: ${latency}ms")
+                    } else {
+                        Log.d(AppConfig.TAG, "StartCore-Manager: Server ${server.remarks} unavailable")
+                    }
+                }
+            }
+        }
+
+        testJobs.awaitAll()
+
+        // Выбираем сервер с минимальной задержкой
+        val bestServer = results.minByOrNull { it.value }?.key
+        
+        // Кэшируем результаты для статистики
+        serverLatencyCache.putAll(results)
+        
+        bestServer?.also {
+            val latency = results[it]
+            Log.i(AppConfig.TAG, "StartCore-Manager: Best server selected: $it (${latency}ms)")
+        }
+
+        bestServer
+    }
+
+    /**
+     * Тестирует задержку конкретного сервера через TCP handshake
+     */
+    private suspend fun testServerLatency(server: ProfileItem): Long = withContext(Dispatchers.IO) {
+        try {
+            val host = server.server ?: return@withContext -1
+            val port = server.serverPort?.toIntOrNull() ?: return@withContext -1
+            
+            // Проверяем TCP соединение к серверу
+            val startTime = SystemClock.elapsedRealtime()
+            
+            val socket = java.net.Socket()
+            socket.connect(InetSocketAddress(host, port), SERVER_TEST_TIMEOUT_MS)
+            socket.close()
+            
+            val latency = SystemClock.elapsedRealtime() - startTime
+            
+            // Дополнительно проверяем через прокси если уже запущен
+            if (coreController.isRunning && latency > 0) {
+                val proxyLatency = testThroughProxy()
+                if (proxyLatency < 0) return@withContext -1 // Прокси не работает с этим сервером
+            }
+            
+            latency
+        } catch (e: Exception) {
+            -1
+        }
+    }
+
+    /**
+     * Тестирует соединение через активный прокси
+     */
+    private suspend fun testThroughProxy(): Long = withContext(Dispatchers.IO) {
+        try {
+            val proxyPort = SettingsManager.getSocksPort()
+            val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
+            
+            val url = URL("https://www.google.com/generate_204")
+            val connection = url.openConnection(proxy) as HttpURLConnection
+            connection.connectTimeout = SERVER_TEST_TIMEOUT_MS
+            connection.readTimeout = SERVER_TEST_TIMEOUT_MS
+            
+            val startTime = SystemClock.elapsedRealtime()
+            val code = connection.responseCode
+            val latency = SystemClock.elapsedRealtime() - startTime
+            connection.disconnect()
+            
+            if (code == 204 || code == 200) latency else -1
+        } catch (e: Exception) {
+            -1
+        }
+    }
+
+    /**
+     * Проверяет валидность конфигурации сервера
+     */
+    private fun isValidServer(config: ProfileItem): Boolean {
+        return when (config.configType) {
+            EConfigType.CUSTOM -> true
+            else -> {
+                val server = config.server.orEmpty()
+                Utils.isValidUrl(server) || Utils.isPureIpAddress(server)
+            }
+        }
+    }
+
+    /**
+     * Очищает кэш задержек (можно вызывать при обновлении списка серверов)
+     */
+    fun clearLatencyCache() {
+        serverLatencyCache.clear()
+    }
+
+    // === КОНЕЦ НОВЫХ МЕТОДОВ ===
+
     private fun startContextService(context: Context) {
         if (coreController.isRunning) {
             Log.w(AppConfig.TAG, "StartCore-Manager: Core already running")
@@ -118,8 +352,6 @@ object V2RayServiceManager {
             Log.e(AppConfig.TAG, "StartCore-Manager: Invalid server configuration")
             return
         }
-//        val result = V2rayConfigUtil.getV2rayConfig(context, guid)
-//        if (!result.status) return
 
         if (MmkvManager.decodeSettingsBool(AppConfig.PREF_PROXY_SHARING)) {
             context.toast(R.string.toast_warning_pref_proxysharing_short)
@@ -143,11 +375,6 @@ object V2RayServiceManager {
         }
     }
 
-    /**
-     * Refer to the official documentation for [registerReceiver](https://developer.android.com/reference/androidx/core/content/ContextCompat#registerReceiver(android.content.Context,android.content.BroadcastReceiver,android.content.IntentFilter,int):
-     * `registerReceiver(Context, BroadcastReceiver, IntentFilter, int)`.
-     * Starts the V2Ray core service.
-     */
     fun startCoreLoop(vpnInterface: ParcelFileDescriptor?): Boolean {
         if (coreController.isRunning) {
             Log.w(AppConfig.TAG, "StartCore-Manager: Core already running")
@@ -184,6 +411,8 @@ object V2RayServiceManager {
             mFilter.addAction(Intent.ACTION_SCREEN_ON)
             mFilter.addAction(Intent.ACTION_SCREEN_OFF)
             mFilter.addAction(Intent.ACTION_USER_PRESENT)
+            // === НОВОЕ: Добавляем слушатель для события переключения сервера ===
+            mFilter.addAction("com.v2ray.ang.ACTION_CONNECTION_FAILED")
             ContextCompat.registerReceiver(service, mMsgReceive, mFilter, Utils.receiverFlags())
         } catch (e: Exception) {
             Log.e(AppConfig.TAG, "StartCore-Manager: Failed to register receiver", e)
@@ -222,11 +451,6 @@ object V2RayServiceManager {
         return true
     }
 
-    /**
-     * Stops the V2Ray core service.
-     * Unregisters broadcast receivers, stops notifications, and shuts down plugins.
-     * @return True if the core was stopped successfully, false otherwise.
-     */
     fun stopCoreLoop(): Boolean {
         val service = getService() ?: return false
 
@@ -252,21 +476,10 @@ object V2RayServiceManager {
         return true
     }
 
-    /**
-     * Queries the statistics for a given tag and link.
-     * @param tag The tag to query.
-     * @param link The link to query.
-     * @return The statistics value.
-     */
     fun queryStats(tag: String, link: String): Long {
         return coreController.queryStats(tag, link)
     }
 
-    /**
-     * Measures the connection delay for the current V2Ray configuration.
-     * Tests with primary URL first, then falls back to alternative URL if needed.
-     * Also fetches remote IP information if the delay test was successful.
-     */
     private fun measureV2rayDelay() {
         if (coreController.isRunning == false) {
             return
@@ -299,7 +512,6 @@ object V2RayServiceManager {
             }
             MessageUtil.sendMsg2UI(service, AppConfig.MSG_MEASURE_DELAY_SUCCESS, result)
 
-            // Only fetch IP info if the delay test was successful
             if (time >= 0) {
                 SpeedtestManager.getRemoteIPInfo()?.let { ip ->
                     MessageUtil.sendMsg2UI(service, AppConfig.MSG_MEASURE_DELAY_SUCCESS, "$result\n$ip")
@@ -308,31 +520,15 @@ object V2RayServiceManager {
         }
     }
 
-    /**
-     * Gets the current service instance.
-     * @return The current service instance, or null if not available.
-     */
     private fun getService(): Service? {
         return serviceControl?.get()?.getService()
     }
 
-    /**
-     * Core callback handler implementation for handling V2Ray core events.
-     * Handles startup, shutdown, socket protection, and status emission.
-     */
     private class CoreCallback : CoreCallbackHandler {
-        /**
-         * Called when V2Ray core starts up.
-         * @return 0 for success, any other value for failure.
-         */
         override fun startup(): Long {
             return 0
         }
 
-        /**
-         * Called when V2Ray core shuts down.
-         * @return 0 for success, any other value for failure.
-         */
         override fun shutdown(): Long {
             val serviceControl = serviceControl?.get() ?: return -1
             return try {
@@ -344,28 +540,12 @@ object V2RayServiceManager {
             }
         }
 
-        /**
-         * Called when V2Ray core emits status information.
-         * @param l Status code.
-         * @param s Status message.
-         * @return Always returns 0.
-         */
         override fun onEmitStatus(l: Long, s: String?): Long {
             return 0
         }
     }
 
-    /**
-     * Broadcast receiver for handling messages sent to the service.
-     * Handles registration, service control, and screen events.
-     */
     private class ReceiveMessageHandler : BroadcastReceiver() {
-        /**
-         * Handles received broadcast messages.
-         * Processes service control messages and screen state changes.
-         * @param ctx The context in which the receiver is running.
-         * @param intent The intent being received.
-         */
         override fun onReceive(ctx: Context?, intent: Intent?) {
             val serviceControl = serviceControl?.get() ?: return
             when (intent?.getIntExtra("key", 0)) {
@@ -378,11 +558,9 @@ object V2RayServiceManager {
                 }
 
                 AppConfig.MSG_UNREGISTER_CLIENT -> {
-                    // nothing to do
                 }
 
                 AppConfig.MSG_STATE_START -> {
-                    // nothing to do
                 }
 
                 AppConfig.MSG_STATE_STOP -> {
@@ -411,6 +589,12 @@ object V2RayServiceManager {
                 Intent.ACTION_SCREEN_ON -> {
                     Log.i(AppConfig.TAG, "StartCore-Manager: Screen on")
                     NotificationManager.startSpeedNotification(currentConfig)
+                }
+                
+                // === НОВОЕ: Обработка события сбоя соединения ===
+                "com.v2ray.ang.ACTION_CONNECTION_FAILED" -> {
+                    Log.w(AppConfig.TAG, "StartCore-Manager: Received connection failure broadcast")
+                    requestServerSwitch()
                 }
             }
         }
