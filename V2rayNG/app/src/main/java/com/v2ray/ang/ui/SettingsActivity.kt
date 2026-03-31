@@ -27,7 +27,21 @@ class SettingsActivity : BaseActivity() {
     }
 
     class SettingsFragment : PreferenceFragmentCompat() {
-
+        private val autoSelectBestServer by lazy { 
+            findPreference<SwitchPreferenceCompat>("pref_auto_select_best_server") 
+        }
+        private val autoSwitchEnabled by lazy { 
+            findPreference<SwitchPreferenceCompat>("pref_auto_switch_enabled") 
+        }
+        private val healthCheckInterval by lazy { 
+            findPreference<ListPreference>("pref_health_check_interval") 
+        }
+        private val maxConsecutiveFailures by lazy { 
+            findPreference<ListPreference>("pref_max_consecutive_failures") 
+        }
+        private val connectionTestUrls by lazy { 
+            findPreference<EditTextPreference>("pref_connection_test_urls") 
+        }
         private val localDns by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_LOCAL_DNS_ENABLED) }
         private val fakeDns by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_FAKE_DNS_ENABLED) }
         private val appendHttpProxy by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_APPEND_HTTP_PROXY) }
@@ -112,6 +126,40 @@ class SettingsActivity : BaseActivity() {
                 updateHevTunSettings(newValue as Boolean)
                 true
             }
+            autoSelectBestServer?.setOnPreferenceChangeListener { _, newValue ->
+                val enabled = newValue as Boolean
+                SettingsManager.setAutoSelectBestServer(enabled)
+                true
+            }
+
+            autoSwitchEnabled?.setOnPreferenceChangeListener { _, newValue ->
+                val enabled = newValue as Boolean
+                SettingsManager.setAutoSwitchEnabled(enabled)
+                // Включаем/выключаем зависимые настройки
+                updateAutoSwitchSettings(enabled)
+                true
+            }
+
+            healthCheckInterval?.setOnPreferenceChangeListener { pref, newValue ->
+                val interval = (newValue as String).toLong()
+                SettingsManager.setHealthCheckIntervalMs(interval)
+                (pref as ListPreference).summary = pref.entries[pref.findIndexOfValue(newValue)]
+                true
+            }
+
+            maxConsecutiveFailures?.setOnPreferenceChangeListener { pref, newValue ->
+                val count = (newValue as String).toInt()
+                SettingsManager.setMaxConsecutiveFailures(count)
+                (pref as ListPreference).summary = pref.entries[pref.findIndexOfValue(newValue)]
+                true
+            }
+
+            connectionTestUrls?.setOnPreferenceChangeListener { pref, newValue ->
+                val urls = newValue as String
+                SettingsManager.setConnectionTestUrls(urls.split(",").map { it.trim() })
+                pref.summary = urls
+                true
+            }
         }
 
         private fun initPreferenceSummaries() {
@@ -167,8 +215,36 @@ class SettingsActivity : BaseActivity() {
 
             // Initialize auto-update interval state
             autoUpdateInterval?.isEnabled = MmkvManager.decodeSettingsBool(AppConfig.SUBSCRIPTION_AUTO_UPDATE, false)
+            autoSelectBestServer?.isChecked = SettingsManager.isAutoSelectBestServer()
+            autoSwitchEnabled?.isChecked = SettingsManager.isAutoSwitchEnabled()
+            
+            // Обновляем состояние зависимых настроек
+            updateAutoSwitchSettings(SettingsManager.isAutoSwitchEnabled())
+            
+            // Устанавливаем summary для новых настроек
+            healthCheckInterval?.let { pref ->
+                val value = SettingsManager.getHealthCheckIntervalMs().toString()
+                val index = pref.findIndexOfValue(value)
+                if (index >= 0) {
+                    pref.summary = pref.entries[index]
+                }
+            }
+            
+            maxConsecutiveFailures?.let { pref ->
+                val value = SettingsManager.getMaxConsecutiveFailures().toString()
+                val index = pref.findIndexOfValue(value)
+                if (index >= 0) {
+                    pref.summary = pref.entries[index]
+                }
+            }
+            
+            connectionTestUrls?.summary = SettingsManager.getConnectionTestUrls().joinToString(", ")
         }
-
+        private fun updateAutoSwitchSettings(enabled: Boolean) {
+            healthCheckInterval?.isEnabled = enabled
+            maxConsecutiveFailures?.isEnabled = enabled
+            connectionTestUrls?.isEnabled = enabled
+        }
         private fun updateMode(value: String?) {
             val vpn = value == VPN
             localDns?.isEnabled = vpn
