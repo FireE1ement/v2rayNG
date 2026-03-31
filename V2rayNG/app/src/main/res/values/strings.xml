@@ -436,5 +436,14 @@
         <item>Local</item>
         <item>WebDAV</item>
     </string-array>
-
+  <!-- Auto Switch Settings -->
+    <string name="title_auto_switch_settings">Auto Server Switch</string>
+    <string name="title_pref_auto_select_best_server">Auto-select best server</string>
+    <string name="summary_pref_auto_select_best_server">Automatically select server with lowest latency on connect</string>
+    <string name="title_pref_auto_switch_enabled">Auto-switch on failure</string>
+    <string name="summary_pref_auto_switch_enabled">Automatically switch to another server when current becomes unavailable</string>
+    <string name="title_pref_health_check_interval">Health check interval</string>
+    <string name="title_pref_max_consecutive_failures">Max failures before switch</string>
+    <string name="title_pref_connection_test_urls">Connection test URLs</string>
+    <string name="summary_pref_connection_test_urls">Comma-separated list of URLs to test connectivity</string>
 </resources>
