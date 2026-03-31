@@ -221,5 +221,30 @@
         <item>half</item>
         <item>full</item>
     </string-array>
+    <string-array name="health_check_intervals">
+        <item>10 секунд</item>
+        <item>30 секунд</item>
+        <item>1 минута</item>
+        <item>5 минут</item>
+    </string-array>
+    <string-array name="health_check_intervals_values">
+        <item>10000</item>
+        <item>30000</item>
+        <item>60000</item>
+        <item>300000</item>
+    </string-array>
 
+    <!-- Максимальное количество сбоев -->
+    <string-array name="max_consecutive_failures">
+        <item>1 сбой</item>
+        <item>2 сбоя</item>
+        <item>3 сбоя</item>
+        <item>5 сбоев</item>
+    </string-array>
+    <string-array name="max_consecutive_failures_values">
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
+        <item>5</item>
+    </string-array>
 </resources>
