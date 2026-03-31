@@ -1,100 +1,40 @@
 package com.v2ray.ang.util
 
 import android.content.Context
-import com.v2ray.ang.dto.AngConfig
-import kotlinx.coroutines.*
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.util.concurrent.atomic.AtomicInteger
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import com.v2ray.ang.dto.AppInfo
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
-object ServerSelector {
-
-    data class ServerTestResult(
-        val config: AngConfig,
-        val latency: Long,
-        val isAvailable: Boolean
-    )
-
+object AppManagerUtil {
     /**
-     * Тестирует все серверы и возвращает лучший по задержке
+     * Load the list of network applications.
+     *
+     * @param context The context to use.
+     * @return A list of AppInfo objects representing the network applications.
      */
-    suspend fun selectBestServer(
-        context: Context,
-        configs: List<AngConfig>,
-        testHost: String = "8.8.8.8",
-        testPort: Int = 53,
-        timeoutMs: Int = 5000
-    ): AngConfig? = withContext(Dispatchers.IO) {
-        
-        if (configs.isEmpty()) return@withContext null
+    suspend fun loadNetworkAppList(context: Context): ArrayList<AppInfo> =
+        withContext(Dispatchers.IO) {
+            val packageManager = context.packageManager
+            val packages = packageManager.getInstalledPackages(PackageManager.GET_PERMISSIONS)
+            val apps = ArrayList<AppInfo>()
 
-        val results = mutableListOf<ServerTestResult>()
-        val semaphore = kotlinx.coroutines.sync.Semaphore(10) // Ограничение параллельных тестов
+            for (pkg in packages) {
+                val applicationInfo = pkg.applicationInfo ?: continue
 
-        val deferredResults = configs.map { config ->
-            async {
-                semaphore.withPermit {
-                    testServerConnection(config, testHost, testPort, timeoutMs)
-                }
+                val appName = applicationInfo.loadLabel(packageManager).toString()
+                val appIcon = applicationInfo.loadIcon(packageManager) ?: continue
+                val isSystemApp = applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM > 0
+
+                val appInfo = AppInfo(appName, pkg.packageName, appIcon, isSystemApp, 0)
+                apps.add(appInfo)
             }
+
+            return@withContext apps
         }
 
-        deferredResults.awaitAll().filter { it.isAvailable }.minByOrNull { it.latency }?.config
-    }
+    fun getLastUpdateTime(context: Context): Long =
+        context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
 
-    /**
-     * Проверяет доступность конкретного сервера
-     */
-    private suspend fun testServerConnection(
-        config: AngConfig,
-        testHost: String,
-        testPort: Int,
-        timeoutMs: Int
-    ): ServerTestResult = withContext(Dispatchers.IO) {
-        
-        val startTime = System.currentTimeMillis()
-        var isAvailable = false
-        
-        try {
-            val socket = Socket()
-            socket.connect(InetSocketAddress(testHost, testPort), timeoutMs)
-            socket.close()
-            isAvailable = true
-        } catch (e: Exception) {
-            isAvailable = false
-        }
-
-        val latency = if (isAvailable) System.currentTimeMillis() - startTime else Long.MAX_VALUE
-        
-        ServerTestResult(config, latency, isAvailable)
-    }
-
-    /**
-     * Проверяет доступность через HTTP запрос (более точный тест)
-     */
-    suspend fun testHttpAvailability(
-        proxyHost: String = "127.0.0.1",
-        proxyPort: Int = 10808,
-        testUrl: String = "https://www.google.com/generate_204",
-        timeoutMs: Int = 10000
-    ): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val proxy = java.net.Proxy(
-                java.net.Proxy.Type.SOCKS, 
-                InetSocketAddress(proxyHost, proxyPort)
-            )
-            val url = java.net.URL(testUrl)
-            val connection = url.openConnection(proxy) as java.net.HttpURLConnection
-            connection.connectTimeout = timeoutMs
-            connection.readTimeout = timeoutMs
-            connection.setRequestProperty("User-Agent", "Mozilla/5.0")
-            
-            val responseCode = connection.responseCode
-            connection.disconnect()
-            
-            responseCode == 204 || responseCode == 200
-        } catch (e: Exception) {
-            false
-        }
-    }
 }
