@@ -74,7 +74,11 @@ object AppConfig {
     const val PREF_HEV_TUNNEL_RW_TIMEOUT = "pref_hev_tunnel_rw_timeout_v2"
     const val PREF_AUTO_REMOVE_INVALID_AFTER_TEST = "pref_auto_remove_invalid_after_test"
     const val PREF_AUTO_SORT_AFTER_TEST = "pref_auto_sort_after_test"
-
+    const val PREF_AUTO_SELECT_BEST_SERVER = "pref_auto_select_best_server"
+    const val PREF_AUTO_SWITCH_ENABLED = "pref_auto_switch_enabled"
+    const val PREF_HEALTH_CHECK_INTERVAL = "pref_health_check_interval"
+    const val PREF_MAX_CONSECUTIVE_FAILURES = "pref_max_consecutive_failures"
+    const val PREF_CONNECTION_TEST_URLS = "pref_connection_test_urls"
     /** Cache keys. */
     const val CACHE_SUBSCRIPTION_ID = "cache_subscription_id"
 
