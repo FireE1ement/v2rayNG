@@ -6,6 +6,7 @@ import androidx.preference.CheckBoxPreference
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceFragmentCompat
+import androidx.preference.SwitchPreferenceCompat
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequest
 import androidx.work.multiprocess.RemoteWorkManager
@@ -15,6 +16,7 @@ import com.v2ray.ang.AppConfig.VPN
 import com.v2ray.ang.R
 import com.v2ray.ang.extension.toLongEx
 import com.v2ray.ang.handler.MmkvManager
+import com.v2ray.ang.handler.SettingsManager
 import com.v2ray.ang.handler.SubscriptionUpdater
 import com.v2ray.ang.helper.MmkvPreferenceDataStore
 import com.v2ray.ang.util.Utils
@@ -27,26 +29,11 @@ class SettingsActivity : BaseActivity() {
     }
 
     class SettingsFragment : PreferenceFragmentCompat() {
-        private val autoSelectBestServer by lazy { 
-            findPreference<SwitchPreferenceCompat>("pref_auto_select_best_server") 
-        }
-        private val autoSwitchEnabled by lazy { 
-            findPreference<SwitchPreferenceCompat>("pref_auto_switch_enabled") 
-        }
-        private val healthCheckInterval by lazy { 
-            findPreference<ListPreference>("pref_health_check_interval") 
-        }
-        private val maxConsecutiveFailures by lazy { 
-            findPreference<ListPreference>("pref_max_consecutive_failures") 
-        }
-        private val connectionTestUrls by lazy { 
-            findPreference<EditTextPreference>("pref_connection_test_urls") 
-        }
+
         private val localDns by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_LOCAL_DNS_ENABLED) }
         private val fakeDns by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_FAKE_DNS_ENABLED) }
         private val appendHttpProxy by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_APPEND_HTTP_PROXY) }
 
-        //        private val localDnsPort by lazy { findPreference<EditTextPreference>(AppConfig.PREF_LOCAL_DNS_PORT) }
         private val vpnDns by lazy { findPreference<EditTextPreference>(AppConfig.PREF_VPN_DNS) }
         private val vpnBypassLan by lazy { findPreference<ListPreference>(AppConfig.PREF_VPN_BYPASS_LAN) }
         private val vpnInterfaceAddress by lazy { findPreference<ListPreference>(AppConfig.PREF_VPN_INTERFACE_ADDRESS_CONFIG_INDEX) }
@@ -70,11 +57,26 @@ class SettingsActivity : BaseActivity() {
         private val hevTunRwTimeout by lazy { findPreference<EditTextPreference>(AppConfig.PREF_HEV_TUNNEL_RW_TIMEOUT) }
         private val useHevTun by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_USE_HEV_TUNNEL) }
 
-        override fun onCreatePreferences(bundle: Bundle?, s: String?) {
-            // Use MMKV as the storage backend for all Preferences
-            // This prevents inconsistencies between SharedPreferences and MMKV
-            preferenceManager.preferenceDataStore = MmkvPreferenceDataStore()
+        // === НОВЫЕ ПОЛЯ ДЛЯ АВТОПЕРЕКЛЮЧЕНИЯ ===
+        private val autoSelectBestServer by lazy { 
+            findPreference<SwitchPreferenceCompat>("pref_auto_select_best_server") 
+        }
+        private val autoSwitchEnabled by lazy { 
+            findPreference<SwitchPreferenceCompat>("pref_auto_switch_enabled") 
+        }
+        private val healthCheckInterval by lazy { 
+            findPreference<ListPreference>("pref_health_check_interval") 
+        }
+        private val maxConsecutiveFailures by lazy { 
+            findPreference<ListPreference>("pref_max_consecutive_failures") 
+        }
+        private val connectionTestUrls by lazy { 
+            findPreference<EditTextPreference>("pref_connection_test_urls") 
+        }
+        // === КОНЕЦ НОВЫХ ПОЛЕЙ ===
 
+        override fun onCreatePreferences(bundle: Bundle?, s: String?) {
+            preferenceManager.preferenceDataStore = MmkvPreferenceDataStore()
             addPreferencesFromResource(R.xml.pref_settings)
 
             initPreferenceSummaries()
@@ -126,40 +128,19 @@ class SettingsActivity : BaseActivity() {
                 updateHevTunSettings(newValue as Boolean)
                 true
             }
+
+            // === НОВЫЕ СЛУШАТЕЛИ (используем MmkvPreferenceDataStore напрямую) ===
             autoSelectBestServer?.setOnPreferenceChangeListener { _, newValue ->
-                val enabled = newValue as Boolean
-                SettingsManager.setAutoSelectBestServer(enabled)
+                // Значение сохраняется автоматически через MmkvPreferenceDataStore
                 true
             }
 
             autoSwitchEnabled?.setOnPreferenceChangeListener { _, newValue ->
                 val enabled = newValue as Boolean
-                SettingsManager.setAutoSwitchEnabled(enabled)
-                // Включаем/выключаем зависимые настройки
                 updateAutoSwitchSettings(enabled)
                 true
             }
-
-            healthCheckInterval?.setOnPreferenceChangeListener { pref, newValue ->
-                val interval = (newValue as String).toLong()
-                SettingsManager.setHealthCheckIntervalMs(interval)
-                (pref as ListPreference).summary = pref.entries[pref.findIndexOfValue(newValue)]
-                true
-            }
-
-            maxConsecutiveFailures?.setOnPreferenceChangeListener { pref, newValue ->
-                val count = (newValue as String).toInt()
-                SettingsManager.setMaxConsecutiveFailures(count)
-                (pref as ListPreference).summary = pref.entries[pref.findIndexOfValue(newValue)]
-                true
-            }
-
-            connectionTestUrls?.setOnPreferenceChangeListener { pref, newValue ->
-                val urls = newValue as String
-                SettingsManager.setConnectionTestUrls(urls.split(",").map { it.trim() })
-                pref.summary = urls
-                true
-            }
+            // === КОНЕЦ НОВЫХ СЛУШАТЕЛЕЙ ===
         }
 
         private fun initPreferenceSummaries() {
@@ -183,7 +164,7 @@ class SettingsActivity : BaseActivity() {
                         }
                     }
 
-                    is CheckBoxPreference, is androidx.preference.SwitchPreferenceCompat -> {
+                    is CheckBoxPreference, is SwitchPreferenceCompat -> {
                     }
                 }
             }
@@ -204,22 +185,20 @@ class SettingsActivity : BaseActivity() {
             super.onStart()
             updateHevTunSettings(MmkvManager.decodeSettingsBool(AppConfig.PREF_USE_HEV_TUNNEL, true))
 
-            // Initialize mode-dependent UI states
             updateMode(MmkvManager.decodeSettingsString(AppConfig.PREF_MODE, VPN))
 
-            // Initialize mux-dependent UI states
             updateMux(MmkvManager.decodeSettingsBool(AppConfig.PREF_MUX_ENABLED, false))
 
-            // Initialize fragment-dependent UI states
             updateFragment(MmkvManager.decodeSettingsBool(AppConfig.PREF_FRAGMENT_ENABLED, false))
 
-            // Initialize auto-update interval state
             autoUpdateInterval?.isEnabled = MmkvManager.decodeSettingsBool(AppConfig.SUBSCRIPTION_AUTO_UPDATE, false)
-            autoSelectBestServer?.isChecked = SettingsManager.isAutoSelectBestServer()
-            autoSwitchEnabled?.isChecked = SettingsManager.isAutoSwitchEnabled()
-            
-            // Обновляем состояние зависимых настроек
-            updateAutoSwitchSettings(SettingsManager.isAutoSwitchEnabled())
+
+            // === НОВАЯ ИНИЦИАЛИЗАЦИЯ ===
+            // Значения загружаются автоматически из MMKV через ключи в XML
+            // Настраиваем только зависимости и summary
+            updateAutoSwitchSettings(
+                MmkvManager.decodeSettingsBool("pref_auto_switch_enabled", false)
+            )
             
             // Устанавливаем summary для новых настроек
             healthCheckInterval?.let { pref ->
@@ -239,18 +218,14 @@ class SettingsActivity : BaseActivity() {
             }
             
             connectionTestUrls?.summary = SettingsManager.getConnectionTestUrls().joinToString(", ")
+            // === КОНЕЦ НОВОЙ ИНИЦИАЛИЗАЦИИ ===
         }
-        private fun updateAutoSwitchSettings(enabled: Boolean) {
-            healthCheckInterval?.isEnabled = enabled
-            maxConsecutiveFailures?.isEnabled = enabled
-            connectionTestUrls?.isEnabled = enabled
-        }
+
         private fun updateMode(value: String?) {
             val vpn = value == VPN
             localDns?.isEnabled = vpn
             fakeDns?.isEnabled = vpn
             appendHttpProxy?.isEnabled = vpn
-//            localDnsPort?.isEnabled = vpn
             vpnDns?.isEnabled = vpn
             vpnBypassLan?.isEnabled = vpn
             vpnInterfaceAddress?.isEnabled = vpn
@@ -275,7 +250,6 @@ class SettingsActivity : BaseActivity() {
 
         private fun updateLocalDns(enabled: Boolean) {
             fakeDns?.isEnabled = enabled
-//            localDnsPort?.isEnabled = enabled
             vpnDns?.isEnabled = !enabled
         }
 
@@ -317,7 +291,6 @@ class SettingsActivity : BaseActivity() {
             muxConcurrency?.summary = concurrency.toString()
         }
 
-
         private fun updateMuxXudpConcurrency(value: String?) {
             if (value == null) {
                 muxXudpQuic?.isEnabled = true
@@ -337,6 +310,16 @@ class SettingsActivity : BaseActivity() {
         private fun updateHevTunSettings(enabled: Boolean) {
             hevTunLogLevel?.isEnabled = enabled
             hevTunRwTimeout?.isEnabled = enabled
+        }
+
+        // === НОВЫЙ МЕТОД ===
+        /**
+         * Обновляет доступность настроек автопереключения
+         */
+        private fun updateAutoSwitchSettings(enabled: Boolean) {
+            healthCheckInterval?.isEnabled = enabled
+            maxConsecutiveFailures?.isEnabled = enabled
+            connectionTestUrls?.isEnabled = enabled
         }
     }
 
